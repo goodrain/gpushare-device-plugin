@@ -59,7 +59,7 @@ func (m *NvidiaDevicePlugin) Allocate(ctx context.Context,
 	m.Lock()
 	defer m.Unlock()
 	log.Infoln("checking...")
-	pods, err := getCandidatePods()
+	pods, err := getCandidatePods(m.queryKubelet, m.kubeletClient)
 	if err != nil {
 		log.Infof("invalid allocation requst: Failed to find candidate pods due to %v", err)
 		return buildErrResponse(reqs, podReqGPU), nil
@@ -108,13 +108,13 @@ func (m *NvidiaDevicePlugin) Allocate(ctx context.Context,
 		if id < 0 {
 			return buildErrResponse(reqs, podReqGPU), nil
 		}
-
+		log.Infof("gpu index %v,uuid: %v", id, candidateDevID)
 		// 1. Create container requests
 		for _, req := range reqs.ContainerRequests {
 			reqGPU := uint(len(req.DevicesIDs))
 			response := pluginapi.ContainerAllocateResponse{
 				Envs: map[string]string{
-					envNVGPU:               candidateDevID,
+					envNVGPU:               fmt.Sprintf("%v", id),
 					EnvResourceIndex:       fmt.Sprintf("%d", id),
 					EnvResourceByPod:       fmt.Sprintf("%d", podReqGPU),
 					EnvResourceByContainer: fmt.Sprintf("%d", reqGPU),
@@ -148,6 +148,34 @@ func (m *NvidiaDevicePlugin) Allocate(ctx context.Context,
 			}
 		}
 
+	} else if len(m.devNameMap) == 1 {
+		var devName string
+		var devIndex uint
+		for d, index := range m.devNameMap {
+			devName = d
+			devIndex = index
+			break
+		}
+		log.Infof("this node has only one gpu device,skip to search pod and directly specify the device  %v(%v) for container", devIndex, devName)
+		for _, req := range reqs.ContainerRequests {
+			reqGPU := uint(len(req.DevicesIDs))
+			response := pluginapi.ContainerAllocateResponse{
+				Envs: map[string]string{
+					envNVGPU:               devName,
+					EnvResourceIndex:       fmt.Sprintf("%d", devIndex),
+					EnvResourceByPod:       fmt.Sprintf("%d", podReqGPU),
+					EnvResourceByContainer: fmt.Sprintf("%d", reqGPU),
+					EnvResourceByDev:       fmt.Sprintf("%d", getGPUMemory()),
+				},
+			}
+			if m.disableCGPUIsolation {
+				response.Envs["CGPU_DISABLE"] = "true"
+			}
+			responses.ContainerResponses = append(responses.ContainerResponses, &response)
+		}
+		log.Infof("get allocated GPUs info %v", responses)
+		return &responses, nil
+
 	} else {
 		log.Warningf("invalid allocation requst: request GPU memory %d can't be satisfied.",
 			podReqGPU)
@@ -155,8 +183,12 @@ func (m *NvidiaDevicePlugin) Allocate(ctx context.Context,
 		return buildErrResponse(reqs, podReqGPU), nil
 	}
 
-	log.Infof("new allocated GPUs info %v", &responses)
-	log.Infoln("----Allocating GPU for gpu mem is ended----")
+	podName := ""
+	if assumePod != nil {
+		podName = assumePod.Name
+	}
+	log.Infof("pod %v, new allocated GPUs info %v", podName, &responses)
+	log.Infof("----Allocating GPU for gpu mem for %v is ended----", podName)
 	// // Add this to make sure the container is created at least
 	// currentTime := time.Now()
 
